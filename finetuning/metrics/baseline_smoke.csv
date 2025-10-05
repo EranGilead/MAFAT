@@ -1,0 +1,2 @@
+model_dir,model_name,num_samples,accuracy,precision,recall,f1,confusion_matrix
+C:\Users\amitg\OneDrive\Documents\MAFAT\finetuning\models\hebert-baseline,finetuning\models\hebert-baseline,512,0.09375,0.4501833589047812,0.09375,0.07545816727608086,"[[17, 1, 0, 0, 324], [8, 2, 0, 0, 72], [2, 1, 0, 0, 32], [1, 0, 0, 0, 20], [3, 0, 0, 0, 29]]"

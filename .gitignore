@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+
+# IDE / editor settings
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Training artifacts
+finetuning/models/
+finetuning/logs/
+finetuning/data/*.jsonl
+!finetuning/data/README.md
+finetuning/rustup-init.exe
+
+#large files
+*baseline_submission/models/
+*hsrc/
+
+# Miscellaneous
+*.log
+*.history*

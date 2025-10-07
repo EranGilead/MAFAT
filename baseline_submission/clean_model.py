@@ -4,7 +4,7 @@ import pandas as pd
 import torch
 from transformers import AutoTokenizer, AutoModel
 from scipy.stats import spearmanr
-
+import pickle 
 # ---------- utils ----------
 def clear_cache():
     gc.collect()
@@ -138,6 +138,35 @@ def run_full(df_long, corpus, relevant_dict, model_name, k=20):
 
     return pd.DataFrame(results)
 
+class E5Retriever:
+    def __init__(self, model_name="intfloat/multilingual-e5-base", device=None):
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name).to(self.device)
+        self.model.eval()
+
+    def embed_texts(self, texts, is_query=False, batch_size=32):
+        if is_query:
+            texts = [f"query: {t.strip()}" for t in texts]
+        else:
+            texts = [f"passage: {t.strip()}" for t in texts]
+
+        all_embeddings = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i+batch_size]
+            enc = self.tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt").to(self.device)
+            with torch.no_grad():
+                out = self.model(**enc)
+                att = enc['attention_mask']
+                emb = out.last_hidden_state
+                mask_exp = att.unsqueeze(-1).expand(emb.size()).float()
+                sum_emb = torch.sum(emb * mask_exp, 1)
+                sum_mask = torch.clamp(mask_exp.sum(1), min=1e-9)
+                emb = sum_emb / sum_mask
+                emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+            all_embeddings.append(emb.cpu())
+            del enc, out, emb
+        return torch.cat(all_embeddings, dim=0).numpy()
 # ---------- example ----------
 if __name__=="__main__":
     file_path = "/Users/gilikurtser/Desktop/Dataset and Baseline/hsrc/hsrc_train.jsonl"
@@ -145,10 +174,17 @@ if __name__=="__main__":
     corpus = build_corpus(df_long)
     relevant_dict = build_relevant_dict(df_long)
 
-    model = "avichr/heBERT"  # אפשר לשים Dicta או מודל אחר
-    df_res = run_full(df_long, corpus, relevant_dict, model, k=20)
+    retriever = E5Retriever(device="mps")
+    P = retriever.embed_texts(corpus['paragraph_text'].tolist(), is_query=False, batch_size=32)
+    pid = corpus['paragraph_uuid'].tolist()
 
-    df_res.to_csv("experiment_spearman_recall_dicta.csv", index=False)
-    df_res.to_json("experiment_spearman_recall_dicta.json", orient="records", force_ascii=False, indent=2)
-    print(df_res.head())
-    print(df_res.mean(numeric_only=True))
+    emb_dict = {pid[i]: P[i] for i in range(len(pid))}
+
+    with open("paragraph_embeddings_e5.pkl","wb") as f:
+        pickle.dump(emb_dict, f)
+
+    with open("relevant_dict.pkl","wb") as f:
+        pickle.dump(relevant_dict, f)
+
+    print("saved", len(emb_dict), "embeddings")
+    print("saved relevant_dict with", len(relevant_dict), "queries")

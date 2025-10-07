@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import random
+from collections import defaultdict
 import pandas as pd
 
 def prepare_training_data(train_file, output_dir):
@@ -32,16 +33,35 @@ def prepare_training_data(train_file, output_dir):
                     'label': label
                 })
     
-    # Shuffle the training pairs
-    random.shuffle(training_pairs)
-    
+    # Group by label and undersample majority class 0
+    rng = random.Random(42)  # reproducible shuffling
+    label_groups = defaultdict(list)
+    for pair in training_pairs:
+        label_groups[pair['label']].append(pair)
+
+    majority_label = 0
+    if label_groups.get(majority_label):
+        other_counts = [len(examples) for lbl, examples in label_groups.items() if lbl != majority_label and len(examples) > 0]
+        if other_counts:
+            target_size = min(len(label_groups[majority_label]), max(other_counts))
+            rng.shuffle(label_groups[majority_label])
+            label_groups[majority_label] = label_groups[majority_label][:target_size]
+
+    balanced_pairs = []
+    for examples in label_groups.values():
+        balanced_pairs.extend(examples)
+
+    rng.shuffle(balanced_pairs)
+    label_distribution = {label: len(examples) for label, examples in label_groups.items()}
+
     # Save the processed data
     output_file = Path(output_dir) / 'training_pairs.jsonl'
     with open(output_file, 'w', encoding='utf-8') as f:
-        for pair in training_pairs:
+        for pair in balanced_pairs:
             f.write(json.dumps(pair, ensure_ascii=False) + '\n')
-    
-    print(f"Processed {len(training_pairs)} training pairs")
+
+    print(f"Processed {len(balanced_pairs)} training pairs (after undersampling label 0)")
+    print(f"Label distribution: {label_distribution}")
     print(f"Data saved to {output_file}")
 
 if __name__ == '__main__':

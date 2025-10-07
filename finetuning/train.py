@@ -4,6 +4,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Optional
+from collections import Counter
 
 import numpy as np
 import torch
@@ -72,6 +73,55 @@ class HebrewQADataset(Dataset):
         return item
 
 
+
+class WeightedTrainer(Trainer):
+    """Trainer subclass that applies per-class weights in the loss."""
+
+    def __init__(self, *args, class_weights: torch.Tensor, **kwargs):
+        super().__init__(*args, **kwargs)
+        if class_weights is None:
+            raise ValueError("class_weights must be provided for WeightedTrainer")
+        self.class_weights = class_weights.float()
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):  # type: ignore[override]
+        labels = inputs.get("labels")
+        outputs = model(**inputs)
+        logits = outputs.get("logits")
+        if labels is None or logits is None:
+            raise ValueError("Both labels and logits must be present for loss computation")
+        loss_fct = torch.nn.CrossEntropyLoss(weight=self.class_weights.to(logits.device))
+        loss = loss_fct(logits.view(-1, model.config.num_labels), labels.view(-1))
+        return (loss, outputs) if return_outputs else loss
+
+
+def _resolve_base_dataset(dataset):
+    """Return the underlying HebrewQADataset and indices for a dataset or Subset."""
+    if isinstance(dataset, Subset):
+        base_dataset, base_indices = _resolve_base_dataset(dataset.dataset)
+        resolved = [base_indices[idx] for idx in dataset.indices]
+        return base_dataset, resolved
+    return dataset, list(range(len(dataset)))
+
+
+def compute_label_counts(dataset) -> Counter:
+    base_dataset, indices = _resolve_base_dataset(dataset)
+    counter = Counter()
+    for idx in indices:
+        counter[base_dataset.examples[idx]["label"]] += 1
+    return counter
+
+
+def build_class_weights(label_counts: Counter, num_labels: int) -> torch.Tensor:
+    total = sum(label_counts.values())
+    weights = []
+    for label in range(num_labels):
+        count = label_counts.get(label, 0)
+        if count == 0:
+            weights.append(0.0)
+        else:
+            weights.append(total / (num_labels * count))
+    return torch.tensor(weights, dtype=torch.float)
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune a Hebrew relevance model.")
     parser.add_argument(
@@ -92,6 +142,7 @@ def parse_args():
         help="Directory where checkpoints and the final model will be saved.",
     )
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs.")
+    parser.add_argument("--skip-training", action="store_true", help="Only save the initialized model without running training.")
     parser.add_argument(
         "--train-batch-size",
         type=int,
@@ -291,6 +342,11 @@ def main():
     if eval_dataset is not None:
         eval_dataset = maybe_slice_dataset(eval_dataset, args.max_eval_samples, args.seed)
 
+    label_counts = compute_label_counts(train_dataset)
+    LOGGER.info("Training label distribution after sampling: %s", label_counts)
+    class_weights = build_class_weights(label_counts, args.num_labels)
+    LOGGER.info("Computed class weights: %s", class_weights.tolist())
+
     eval_strategy = args.evaluation_strategy
     if eval_dataset is None and eval_strategy != "no":
         LOGGER.warning("No validation split detected; falling back to 'no' evaluation strategy.")
@@ -323,16 +379,20 @@ def main():
         report_to=["none"],
     )
 
-    trainer = Trainer(
+    trainer = WeightedTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         tokenizer=tokenizer,
         compute_metrics=build_compute_metrics(args.num_labels) if eval_strategy != "no" else None,
+        class_weights=class_weights,
     )
 
-    trainer.train(resume_from_checkpoint=str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None)
+    if not args.skip_training:
+        trainer.train(resume_from_checkpoint=str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None)
+    else:
+        LOGGER.info("skip-training enabled; saving initialized model without updates")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(output_dir))

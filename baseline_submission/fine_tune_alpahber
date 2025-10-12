@@ -1,0 +1,290 @@
+# train_hardneg_alephbert.py
+import os, re, json, random, pickle, glob, numpy as np, pandas as pd, torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer, AutoModel
+from torch.optim import AdamW
+from sklearn.model_selection import train_test_split
+from sklearn.metrics.pairwise import cosine_similarity
+from tqdm import tqdm
+
+# env hygiene (quiet tokenizers, allow full mps mem if available)
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+if torch.backends.mps.is_available():
+    os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
+
+# ---------------- utils ----------------
+def set_seed(s=42):
+    random.seed(s); np.random.seed(s); torch.manual_seed(s)
+def device_str():
+    return "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+def digits_key(k):
+    m = re.findall(r"\d+", str(k)); return int(m[-1]) if m else 0
+
+def latest_ckpt_dir(base="finetuned_ckpts"):
+    if not os.path.isdir(base): return None
+    cks = sorted(glob.glob(os.path.join(base, "epoch_*")), key=lambda p: int(p.split("_")[-1]))
+    return cks[-1] if cks else None
+
+# ---------------- data ----------------
+def load_hsrc(path):
+    rows = []
+    for line in open(path, "r", encoding="utf-8"):
+        r = json.loads(line)
+        par_items = sorted(r["paragraphs"].items(), key=lambda kv: digits_key(kv[0]))
+        tgt_items = sorted(r["target_actions"].items(), key=lambda kv: digits_key(kv[0]))
+        for (_, p), (_, rel) in zip(par_items, tgt_items):
+            rows.append({
+                "query_uuid": r["query_uuid"],
+                "query": r["query"],
+                "source": r.get("case_name",""),
+                "paragraph_uuid": p["uuid"],
+                "paragraph_text": p["passage"],
+                "relevance": int(rel) if rel is not None else 0
+            })
+    return pd.DataFrame(rows)
+
+def build_corpus(df):
+    return df[["paragraph_uuid","paragraph_text"]].drop_duplicates("paragraph_uuid").reset_index(drop=True)
+
+# ---------------- e5 encoder (for hard negatives) ----------------
+class E5Encoder:
+    def __init__(self, name="intfloat/multilingual-e5-base", device=None):
+        self.device = device or device_str()
+        self.tok = AutoTokenizer.from_pretrained(name)
+        self.mdl = AutoModel.from_pretrained(name).to(self.device)
+        self.mdl.eval()
+    @torch.no_grad()
+    def encode(self, texts, is_query=False, bs=64, max_len=250):
+        if is_query:
+            texts = [f"query: {t.strip()}" for t in texts]
+        else:
+            texts = [f"passage: {t.strip()}" for t in texts]
+        out = []
+        for i in range(0, len(texts), bs):
+            enc = self.tok(texts[i:i+bs], padding=True, truncation=True, max_length=max_len, return_tensors="pt").to(self.device)
+            o = self.mdl(**enc).last_hidden_state
+            att = enc["attention_mask"]
+            emb = (o * att.unsqueeze(-1)).sum(1) / att.sum(1, keepdim=True)
+            emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+            out.append(emb.cpu().numpy())
+        return np.vstack(out) if out else np.zeros((0,768), dtype=np.float32)
+
+# ---------------- triplet dataset ----------------
+class TripletDataset(Dataset):
+    def __init__(self, triples):
+        self.q = [t[0] for t in triples]
+        self.pos = [t[1] for t in triples]
+        self.neg = [t[2] for t in triples]
+    def __len__(self): return len(self.q)
+    def __getitem__(self, i): return self.q[i], self.pos[i], self.neg[i]
+
+# ---------------- alephbert bi-encoder ----------------
+class BiEncoder(torch.nn.Module):
+    def __init__(self, name="onlplab/alephbert-base"):
+        super().__init__()
+        self.enc = AutoModel.from_pretrained(name)
+    @staticmethod
+    def _mean_pool(last_hidden_state, att):
+        return (last_hidden_state * att.unsqueeze(-1)).sum(1) / att.sum(1, keepdim=True)
+    def encode_batch(self, tok, texts, device, max_len=250, requires_grad=True):
+        ctx = torch.enable_grad() if requires_grad else torch.no_grad()
+        with ctx:
+            enc = tok(texts, padding=True, truncation=True, max_length=max_len, return_tensors="pt").to(device)
+            out = self.enc(**enc).last_hidden_state
+            emb = self._mean_pool(out, enc["attention_mask"])
+            emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+            return emb
+
+# ---------------- hard negatives via e5 ----------------
+def mine_hard_negatives_e5(df_train, corpus_df, relevant_dict, top_m=100, neg_per_pos=2, seed=42):
+    rng = random.Random(seed)
+    pid = corpus_df["paragraph_uuid"].tolist()
+    pid2text = dict(zip(corpus_df["paragraph_uuid"], corpus_df["paragraph_text"]))
+    q_df = df_train[["query_uuid","query"]].drop_duplicates("query_uuid").reset_index(drop=True)
+    qids = q_df["query_uuid"].tolist(); qtxt = q_df["query"].tolist()
+
+    device = device_str()
+    e5 = E5Encoder(device=device)
+    P_e5 = e5.encode(corpus_df["paragraph_text"].tolist(), is_query=False, bs=64, max_len=250)
+    Q_e5 = e5.encode(qtxt, is_query=True, bs=64, max_len=250)
+
+    qid2cands = {}
+    for qi, qid in enumerate(qids):
+        sims = (Q_e5[qi:qi+1] @ P_e5.T).ravel()
+        order = np.argsort(-sims)
+        rel = relevant_dict.get(qid, set())
+        cands = [pid[j] for j in order if pid[j] not in rel][:top_m]
+        qid2cands[qid] = cands
+
+    triples = []
+    for qid, qtext, pos_text in df_train[df_train["relevance"]>0][["query_uuid","query","paragraph_text"]].values.tolist():
+        cands = qid2cands.get(qid, [])
+        if not cands: continue
+        for _ in range(neg_per_pos):
+            neg_pid = rng.choice(cands)
+            triples.append((qtext, pos_text, pid2text[neg_pid]))
+    return triples
+
+# ---------------- training loop (memory-safe) ----------------
+def train_triplet_alephbert(triples, epochs=4, lr=2e-5,
+                            batch_size=4, grad_accum_steps=8,
+                            margin=0.4, train_max_len=192, seed=42,
+                            ckpt_base="finetuned_ckpts", resume=True):
+    set_seed(seed)
+    device = device_str()
+    tok = AutoTokenizer.from_pretrained("onlplab/alephbert-base")
+    model = BiEncoder().to(device)
+
+    # reduce memory
+    model.enc.gradient_checkpointing_enable()
+
+    dl = DataLoader(TripletDataset(triples), batch_size=batch_size, shuffle=True, drop_last=True, num_workers=0)
+    opt = AdamW(model.parameters(), lr=lr)
+    loss_fn = torch.nn.TripletMarginLoss(margin=margin, p=2)
+
+    start_epoch = 0
+    if resume:
+        last = latest_ckpt_dir(ckpt_base)
+        if last:
+            print(f"resuming from {last}")
+            model.enc = AutoModel.from_pretrained(last).to(device)
+            start_epoch = int(os.path.basename(last).split("_")[-1])
+
+    model.train()
+    os.makedirs(ckpt_base, exist_ok=True)
+
+    for ep in range(start_epoch, epochs):
+        losses=[]
+        opt.zero_grad(set_to_none=True)
+        for step, (qs, ps, ns) in enumerate(tqdm(dl, desc=f"epoch {ep+1}")):
+            q_emb = model.encode_batch(tok, list(qs), device, max_len=train_max_len, requires_grad=True)
+            p_emb = model.encode_batch(tok, list(ps), device, max_len=train_max_len, requires_grad=True)
+            n_emb = model.encode_batch(tok, list(ns), device, max_len=train_max_len, requires_grad=True)
+
+            loss = loss_fn(q_emb, p_emb, n_emb) / grad_accum_steps
+            loss.backward()
+            losses.append(float(loss.detach().cpu()) * grad_accum_steps)
+
+            if (step + 1) % grad_accum_steps == 0:
+                opt.step(); opt.zero_grad(set_to_none=True)
+                if torch.backends.mps.is_available(): torch.mps.empty_cache()
+
+        print(f"epoch {ep+1} loss {np.mean(losses):.4f}")
+
+        # save checkpoint every epoch
+        save_dir = os.path.join(ckpt_base, f"epoch_{ep+1}")
+        os.makedirs(save_dir, exist_ok=True)
+        model.enc.save_pretrained(save_dir)
+        tok.save_pretrained(save_dir)
+
+    return model, tok, device
+
+# ---------------- embed & eval ----------------
+def embed_corpus(model, tok, corpus_df, device, max_len=250, bs=64):
+    texts = corpus_df["paragraph_text"].tolist()
+    all_embs=[]; model.eval()
+    with torch.no_grad():
+        for i in range(0, len(texts), bs):
+            enc = tok(texts[i:i+bs], padding=True, truncation=True, max_length=max_len, return_tensors="pt").to(device)
+            out = model.enc(**enc).last_hidden_state
+            att = enc["attention_mask"]
+            emb = (out * att.unsqueeze(-1)).sum(1) / att.sum(1, keepdim=True)
+            emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+            all_embs.append(emb.cpu().numpy())
+    P = np.vstack(all_embs)
+    pid = corpus_df["paragraph_uuid"].tolist()
+    return {pid[i]: P[i] for i in range(len(pid))}
+
+def embed_queries(model, tok, texts, device, max_len=250, bs=64):
+    all_embs=[]; model.eval()
+    with torch.no_grad():
+        for i in range(0, len(texts), bs):
+            enc = tok(texts[i:i+bs], padding=True, truncation=True, max_length=max_len, return_tensors="pt").to(device)
+            out = model.enc(**enc).last_hidden_state
+            att = enc["attention_mask"]
+            emb = (out * att.unsqueeze(-1)).sum(1) / att.sum(1, keepdim=True)
+            emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+            all_embs.append(emb.cpu().numpy())
+    return np.vstack(all_embs)
+
+def recall_at_k(pred_ids, relevant_ids, k=100):
+    if not relevant_ids: return np.nan
+    hits = sum(1 for pid in pred_ids[:k] if pid in relevant_ids)
+    return hits / len(relevant_ids)
+
+def evaluate_recall(emb_dict, model, tok, df_test, corpus_df, relevant_dict, device, k=100, max_len=250):
+    pid_list = corpus_df["paragraph_uuid"].tolist()
+    P = np.array([emb_dict[p] for p in pid_list])
+
+    queries = df_test[["query_uuid","query"]].drop_duplicates("query_uuid")
+    qids = queries["query_uuid"].tolist()
+    qtxt = queries["query"].tolist()
+    Q = embed_queries(model, tok, qtxt, device, max_len=max_len)
+
+    recs=[]
+    for q_emb, qid in zip(Q, qids):
+        sims = cosine_similarity(q_emb.reshape(1,-1), P).ravel()
+        top = np.argsort(-sims)[:k]
+        pred = [pid_list[i] for i in top]
+        r = recall_at_k(pred, relevant_dict.get(qid, set()), k)
+        if not np.isnan(r): recs.append(r)
+    recs = np.array(recs)
+    print(f"Recall@{k} mean={recs.mean():.4f} median={np.median(recs):.4f} std={recs.std():.4f}")
+    return recs.mean()
+
+# ---------------- main ----------------
+def main():
+    set_seed(42)
+    data_path = "/Users/gilikurtser/Desktop/Dataset and Baseline/hsrc/hsrc_train.jsonl"
+
+    df = load_hsrc(data_path)
+    corpus = build_corpus(df)
+
+    with open("relevant_dict.pkl","rb") as f:
+        relevant_dict = pickle.load(f)
+    print("loaded relevant_dict:", len(relevant_dict))
+
+    qids = df["query_uuid"].unique()
+    train_q, test_q = train_test_split(qids, test_size=0.5, random_state=42)
+    df_train = df[df["query_uuid"].isin(train_q)].reset_index(drop=True)
+    df_test  = df[df["query_uuid"].isin(test_q)].reset_index(drop=True)
+    print(f"train pairs={len(df_train)}, test pairs={len(df_test)}")
+
+    print("mining hard negatives with e5 ...")
+    triples = mine_hard_negatives_e5(
+        df_train=df_train,
+        corpus_df=corpus,
+        relevant_dict=relevant_dict,
+        top_m=50,
+        neg_per_pos=1,
+        seed=42
+    )
+    print("triples:", len(triples))
+
+    model, tok, device = train_triplet_alephbert(
+        triples=triples,
+        epochs=6,
+        lr=2e-5,
+        batch_size=4,           # small batch
+        grad_accum_steps=8,     # effective batch = 32
+        margin=0.4,
+        train_max_len=192,      # train shorter
+        seed=42,
+        ckpt_base="finetuned_ckpts",
+        resume=True
+    )
+
+    emb_dict = embed_corpus(model, tok, corpus, device, max_len=250, bs=64)
+    with open("paragraph_embeddings_alephbert_triplet.pkl","wb") as f:
+        pickle.dump(emb_dict, f)
+    print("saved paragraph embeddings:", len(emb_dict))
+
+    evaluate_recall(emb_dict, model, tok, df_test, corpus, relevant_dict, device, k=100, max_len=250)
+
+    os.makedirs("finetuned_alephbert_triplet", exist_ok=True)
+    model.enc.save_pretrained("finetuned_alephbert_triplet")
+    tok.save_pretrained("finetuned_alephbert_triplet")
+    print("saved model → finetuned_alephbert_triplet/")
+
+if __name__ == "__main__":
+    main()

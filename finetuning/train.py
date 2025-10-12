@@ -122,6 +122,54 @@ def build_class_weights(label_counts: Counter, num_labels: int) -> torch.Tensor:
             weights.append(total / (num_labels * count))
     return torch.tensor(weights, dtype=torch.float)
 
+
+
+
+def log_per_class_metrics(trainer: Trainer, dataset, split_name: str, num_labels: int) -> None:
+    """Run prediction on a dataset and log per-class precision/recall/F1."""
+    prediction_output = trainer.predict(dataset, metric_key_prefix=split_name)
+    logits = prediction_output.predictions
+
+    if isinstance(logits, tuple):
+        logits = logits[0]
+
+    preds = np.argmax(logits, axis=-1)
+    labels = prediction_output.label_ids
+
+    label_ids = list(range(num_labels))
+    precision, recall, f1, support = precision_recall_fscore_support(
+        labels,
+        preds,
+        labels=label_ids,
+        average=None,
+        zero_division=0,
+    )
+    accuracy = accuracy_score(labels, preds)
+    conf = confusion_matrix(labels, preds, labels=label_ids)
+
+    LOGGER.info("%s metrics:", split_name.capitalize())
+    LOGGER.info("  accuracy: %.4f", accuracy)
+    for idx, (p_val, r_val, f_val, supp) in enumerate(zip(precision, recall, f1, support)):
+        LOGGER.info(
+            "  label %d -> precision: %.4f | recall: %.4f | f1: %.4f | support: %d",
+            idx,
+            p_val,
+            r_val,
+            f_val,
+            int(supp),
+        )
+    LOGGER.info("  confusion matrix:%s", conf)
+
+    log_payload = {f"{split_name}/accuracy": float(accuracy)}
+    for idx, (p_val, r_val, f_val, supp) in enumerate(zip(precision, recall, f1, support)):
+        log_payload[f"{split_name}/precision_class_{idx}"] = float(p_val)
+        log_payload[f"{split_name}/recall_class_{idx}"] = float(r_val)
+        log_payload[f"{split_name}/f1_class_{idx}"] = float(f_val)
+        log_payload[f"{split_name}/support_class_{idx}"] = float(supp)
+
+    trainer.log(log_payload)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune a Hebrew relevance model.")
     parser.add_argument(
@@ -168,6 +216,12 @@ def parse_args():
         help="Linear warmup over warmup_ratio fraction of training steps.",
     )
     parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=None,
+        help="Number of warmup steps; overrides warmup_ratio when set.",
+    )
+    parser.add_argument(
         "--weight-decay",
         type=float,
         default=0.01,
@@ -206,8 +260,8 @@ def parse_args():
     parser.add_argument(
         "--save-total-limit",
         type=int,
-        default=2,
-        help="Maximum number of checkpoints to keep on disk.",
+        default=None,
+        help="Maximum number of checkpoints to keep on disk (None keeps all).",
     )
     parser.add_argument(
         "--val-ratio",
@@ -267,6 +321,12 @@ def parse_args():
         action="store_true",
         help="Enable bfloat16 mixed precision (for Ampere+ GPUs).",
     )
+    parser.add_argument(
+        "--lr-scheduler-type",
+        choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"],
+        default="linear",
+        help="Learning-rate schedule (Transformer Trainer options).",
+    )
 
     return parser.parse_args()
 
@@ -279,22 +339,36 @@ def build_compute_metrics(num_labels: int):
         preds = np.argmax(logits, axis=-1)
         labels = pred.label_ids
 
-        precision, recall, f1, _ = precision_recall_fscore_support(
+        weighted_precision, weighted_recall, weighted_f1, _ = precision_recall_fscore_support(
             labels,
             preds,
             average="weighted",
             zero_division=0,
         )
+        per_precision, per_recall, per_f1, support = precision_recall_fscore_support(
+            labels,
+            preds,
+            labels=label_ids,
+            average=None,
+            zero_division=0,
+        )
         accuracy = accuracy_score(labels, preds)
         conf = confusion_matrix(labels, preds, labels=label_ids)
 
-        return {
+        LOGGER.info("Eval confusion matrix:%s", conf)
+
+        metrics = {
             "accuracy": accuracy,
-            "precision": precision,
-            "recall": recall,
-            "f1": f1,
-            "confusion_matrix": conf.tolist(),
+            "precision": weighted_precision,
+            "recall": weighted_recall,
+            "f1": weighted_f1,
         }
+        for idx, (p_val, r_val, f_val, supp) in enumerate(zip(per_precision, per_recall, per_f1, support)):
+            metrics[f"precision_class_{idx}"] = float(p_val)
+            metrics[f"recall_class_{idx}"] = float(r_val)
+            metrics[f"f1_class_{idx}"] = float(f_val)
+            metrics[f"support_class_{idx}"] = float(supp)
+        return metrics
 
     return compute_metrics
 
@@ -362,6 +436,7 @@ def main():
         per_device_eval_batch_size=args.eval_batch_size,
         learning_rate=args.learning_rate,
         warmup_ratio=args.warmup_ratio,
+        warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
         logging_dir=str(output_dir / "logs"),
         logging_strategy=logging_strategy,
@@ -376,7 +451,8 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         fp16=args.fp16,
         bf16=args.bf16,
-        report_to=["none"],
+        lr_scheduler_type=args.lr_scheduler_type,
+        report_to=["tensorboard"],
     )
 
     trainer = WeightedTrainer(
@@ -393,6 +469,12 @@ def main():
         trainer.train(resume_from_checkpoint=str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None)
     else:
         LOGGER.info("skip-training enabled; saving initialized model without updates")
+
+    LOGGER.info("Collecting per-class metrics on training split...")
+    log_per_class_metrics(trainer, train_dataset, "train", args.num_labels)
+    if eval_dataset is not None:
+        LOGGER.info("Collecting per-class metrics on evaluation split...")
+        log_per_class_metrics(trainer, eval_dataset, "eval", args.num_labels)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(output_dir))

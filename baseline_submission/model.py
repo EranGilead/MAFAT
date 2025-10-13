@@ -23,7 +23,7 @@ class E5Retriever:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
-        print(f"Loading E5 multilingual model on device: {self.device}")
+        print(f"Loading {model_name} model on device: {self.device}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModel.from_pretrained(model_name, dtype=torch.float16).to(self.device)
         self.model.eval()
@@ -146,7 +146,7 @@ class BGEReranker:
         
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         
-        print(f"Loading BGE reranker on device: {self.device}")
+        print(f"Loading {model_name} reranker on device: {self.device}")
         
         # BGE reranker is actually a special model type
         from transformers import AutoModelForSequenceClassification

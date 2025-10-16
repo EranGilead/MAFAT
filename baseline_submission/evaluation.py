@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
 from model import E5Retriever, BGEReranker
+from normalization import normalize_text, load_hebrew_nlp
 
 LOGGER = logging.getLogger(__name__)
 
@@ -71,6 +72,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=100,
         help="Number of passages to keep after reranking for metric computation.",
+    )
+    parser.add_argument(
+        "--normalize-queries",
+        action="store_true",
+        help="Apply Hebrew normalization (needs hebspacy) before retrieval.",
     )
     parser.add_argument(
         "--results-path",
@@ -312,6 +318,22 @@ def main() -> None:
         raise ValueError("No valid examples after filtering for queries with label mappings.")
 
     device = infer_device(args.device)
+    if args.normalize_queries:
+        try:
+            pipeline = load_hebrew_nlp()
+            LOGGER.info("Loaded hebspacy pipeline for query normalization.")
+        except ImportError:
+            LOGGER.warning("hebspacy not available; proceeding without normalization.")
+            args.normalize_queries = False
+            pipeline = None
+        else:
+            for example in filtered_examples:
+                example["normalized_query"] = normalize_text(
+                    example["query"], nlp=pipeline, lemmatize=True
+                )
+    else:
+        pipeline = None
+
     retriever = E5Retriever(model_name=args.retriever_model, device=str(device))
     reranker = BGEReranker(model_name=args.reranker_model, device=str(device))
 
@@ -323,13 +345,14 @@ def main() -> None:
     rankings: List[List[str]] = []
     label_maps = []
     for example in filtered_examples:
+        query_text = example["normalized_query"] if args.normalize_queries else example["query"]
         ranking_ids = retrieve_and_rerank(
             retriever,
             reranker,
             paragraph_ids,
             paragraph_matrix,
             corpus_texts,
-            example["query"],
+            query_text,
             args.retrieval_top_k,
             args.rerank_top_k,
         )

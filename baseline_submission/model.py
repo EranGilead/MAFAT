@@ -264,13 +264,23 @@ def preprocess(corpus_dict):
     # Store corpus IDs, passages, and original texts
     retriever.corpus_ids = list(corpus_dict.keys())
     passages = [doc.get('passage', doc.get('text', '')) for doc in corpus_dict.values()]
-    
+
     # Store original texts for reranking
     corpus_texts = {doc_id: passages[i] for i, doc_id in enumerate(retriever.corpus_ids)}
+
+    # Optionally normalise passages before embedding
+    normalized_passages = passages
+    if passages:
+        try:
+            pipeline = load_hebrew_nlp()
+            normalized_passages = [normalize_text(p, nlp=pipeline) for p in passages]
+            print("Applied Hebrew normalization to passages before embedding.")
+        except ImportError:
+            print("hebspacy not available; using raw passages for embeddings.")
     
     # Compute embeddings with conservative batch size for retrieval
     print("Computing E5 embeddings...")
-    retriever.corpus_embeddings = retriever.embed_texts(passages, is_query=False, batch_size=32)
+    retriever.corpus_embeddings = retriever.embed_texts(normalized_passages, is_query=False, batch_size=32)
     
     print("✓ Corpus preprocessing complete!")
     print(f"✓ Generated embeddings for {len(retriever.corpus_ids)} documents")

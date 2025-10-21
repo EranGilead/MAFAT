@@ -1,32 +1,19 @@
-
 import argparse
 import json
 import logging
-import pickle
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
-import torch
 from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
-from model import E5Retriever, BGEReranker
-from normalization import normalize_text, load_hebrew_nlp
 
-LOGGER = logging.getLogger(__name__)
+from model import preprocess, predict
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Evaluate retrieval quality using precomputed paragraph embeddings and a query encoder. "
-            "Samples HSRC queries and evaluates retrieval + relevance metrics."
-        )
-    )
-    parser.add_argument(
-        "--embeddings-path",
-        required=True,
-        type=Path,
-        help="Path to a pickle file that maps paragraph IDs to embedding vectors.",
+        description="Evaluate retrieval + relevance pipeline using model.py preprocess/predict"
     )
     parser.add_argument(
         "--dataset-path",
@@ -47,36 +34,20 @@ def parse_args() -> argparse.Namespace:
         help="Random seed used to shuffle the dataset before sampling.",
     )
     parser.add_argument(
-        "--device",
-        default=None,
-        help="Device to run inference on (e.g. 'cuda', 'cuda:0', 'mps', 'cpu'). Defaults to auto-detection.",
-    )
-    parser.add_argument(
-        "--retriever-model",
-        default=None,
-        help="Model identifier or path for the retriever (E5). Defaults to local cache if omitted.",
-    )
-    parser.add_argument(
-        "--reranker-model",
-        default=None,
-        help="Model identifier or path for the reranker (BGE). Defaults to local cache if omitted.",
-    )
-    parser.add_argument(
-        "--retrieval-top-k",
-        type=int,
-        default=100,
-        help="Number of passages retrieved before reranking.",
-    )
-    parser.add_argument(
-        "--rerank-top-k",
-        type=int,
-        default=100,
-        help="Number of passages to keep after reranking for metric computation.",
-    )
-    parser.add_argument(
-        "--normalize-queries",
+        "--use-normalization",
         action="store_true",
-        help="Apply Hebrew normalization (needs hebspacy) before retrieval.",
+        help="Use Hebrew normalization when building embeddings and embedding queries.",
+    )
+    parser.add_argument(
+        "--use-bm25",
+        action="store_true",
+        help="Use BM25 lexical retrieval and rely solely on E5 embeddings.",
+    )
+    parser.add_argument(
+        "--bm25-alpha",
+        type=float,
+        default=0.8,
+        help="Weight for E5 similarity when mixing with BM25 (alpha * E5 + (1-alpha) * BM25).",
     )
     parser.add_argument(
         "--results-path",
@@ -85,31 +56,6 @@ def parse_args() -> argparse.Namespace:
         help="Optional path to store the computed metrics as JSON.",
     )
     return parser.parse_args()
-
-
-def infer_device(device_arg: Optional[str]) -> torch.device:
-    if device_arg:
-        return torch.device(device_arg)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def load_embeddings(path: Path) -> Tuple[List[str], np.ndarray]:
-    with path.open("rb") as handle:
-        data = pickle.load(handle)
-    if not isinstance(data, dict):
-        raise ValueError(f"Expected embeddings pickle to contain a dict, got {type(data)}")
-    paragraph_ids = list(data.keys())
-    try:
-        matrix = np.vstack([np.asarray(data[pid], dtype=np.float32) for pid in paragraph_ids])
-    except Exception as exc:  # pragma: no cover - defensively handle malformed files
-        raise ValueError("Failed to stack embeddings into a matrix") from exc
-    return paragraph_ids, matrix
-
-
 
 
 def load_dataset(path: Path) -> Tuple[List[dict], Dict[str, str]]:
@@ -153,51 +99,7 @@ def load_dataset(path: Path) -> Tuple[List[dict], Dict[str, str]]:
     return examples, corpus_texts
 
 
-
-def retrieve_and_rerank(
-    retriever: E5Retriever,
-    reranker: BGEReranker,
-    paragraph_ids: List[str],
-    paragraph_matrix: np.ndarray,
-    corpus_texts: Dict[str, str],
-    query_text: str,
-    retrieval_top_k: int,
-    rerank_top_k: int,
-) -> List[str]:
-    query_vec = retriever.embed_texts([query_text], is_query=True, batch_size=1)[0]
-    scores = paragraph_matrix @ query_vec
-    candidate_indices = np.argsort(-scores)
-
-    candidate_ids: List[str] = []
-    candidate_passages: List[str] = []
-    for idx in candidate_indices:
-        pid = paragraph_ids[idx]
-        passage = corpus_texts.get(pid)
-        if not passage:
-            continue
-        candidate_ids.append(pid)
-        candidate_passages.append(passage)
-        if len(candidate_ids) >= retrieval_top_k:
-            break
-
-    if not candidate_ids:
-        return []
-
-    rerank_k = min(len(candidate_ids), rerank_top_k)
-    reranked = reranker.rerank(
-        query_text,
-        candidate_passages,
-        candidate_ids,
-        top_k=rerank_k,
-    )
-    return [pid for pid, _ in reranked]
-
-
-
-def compute_metrics(
-    rankings: List[List[str]],
-    label_maps: List[Dict[str, int]],
-) -> Dict[str, float]:
+def compute_metrics(rankings: List[List[str]], label_maps: List[Dict[str, int]]) -> Dict[str, float]:
     if len(rankings) != len(label_maps):
         raise ValueError("Rankings and label maps must have the same length")
 
@@ -293,76 +195,54 @@ def main() -> None:
     args = parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    LOGGER.info("Loading paragraph embeddings from %s", args.embeddings_path)
-    paragraph_ids, paragraph_matrix = load_embeddings(args.embeddings_path)
-    LOGGER.info("Loaded %d paragraph embeddings (dim=%d)", len(paragraph_ids), paragraph_matrix.shape[1])
+    LOGGER = logging.getLogger(__name__)
 
     LOGGER.info("Loading HSRC dataset from %s", args.dataset_path)
     dataset, corpus_texts = load_dataset(args.dataset_path)
+
     rng = random.Random(args.seed)
     rng.shuffle(dataset)
     sample_size = min(args.sample_size, len(dataset))
     sampled_examples = dataset[-sample_size:]
 
-    filtered_examples: List[dict] = []
-    for item in sampled_examples:
-        query = item.get("query")
-        label_map = item.get("label_map")
-        if not isinstance(query, str) or not query.strip() or not isinstance(label_map, dict):
-            continue
-        if not label_map:
-            continue
-        filtered_examples.append({"query": query, "label_map": label_map})
+    if not sampled_examples:
+        raise ValueError("Dataset sample is empty; adjust --sample-size or dataset path")
 
-    if not filtered_examples:
-        raise ValueError("No valid examples after filtering for queries with label mappings.")
+    relevant_ids = set()
+    for example in sampled_examples:
+        relevant_ids.update(example.get("label_map", {}).keys())
+    corpus_dict = {pid: {"text": corpus_texts[pid]} for pid in relevant_ids if pid in corpus_texts}
+    LOGGER.info("Building retrieval index over %d passages (sample-limited)", len(corpus_dict))
 
-    device = infer_device(args.device)
-    if args.normalize_queries:
-        try:
-            pipeline = load_hebrew_nlp()
-            LOGGER.info("Loaded hebspacy pipeline for query normalization.")
-        except ImportError:
-            LOGGER.warning("hebspacy not available; proceeding without normalization.")
-            args.normalize_queries = False
-            pipeline = None
-        else:
-            for example in filtered_examples:
-                example["normalized_query"] = normalize_text(
-                    example["query"], nlp=pipeline, lemmatize=True
-                )
-    else:
-        pipeline = None
+    if not corpus_dict:
+        raise ValueError("Corpus dictionary is empty; nothing to preprocess.")
 
-    retriever = E5Retriever(model_name=args.retriever_model, device=str(device))
-    reranker = BGEReranker(model_name=args.reranker_model, device=str(device))
-
-    retriever.corpus_ids = paragraph_ids
-    retriever.corpus_embeddings = paragraph_matrix
-
-    LOGGER.info("Evaluating %d queries (top_k=%d, rerank_k=%d)", len(filtered_examples), args.retrieval_top_k, args.rerank_top_k)
+    # --- updated preprocess call ---
+    preprocessed_data = preprocess(
+        corpus_dict,
+        use_normalization=args.use_normalization,
+        use_bm25=args.use_bm25,
+    )
 
     rankings: List[List[str]] = []
-    label_maps = []
-    for example in filtered_examples:
-        query_text = example["normalized_query"] if args.normalize_queries else example["query"]
-        ranking_ids = retrieve_and_rerank(
-            retriever,
-            reranker,
-            paragraph_ids,
-            paragraph_matrix,
-            corpus_texts,
-            query_text,
-            args.retrieval_top_k,
-            args.rerank_top_k,
-        )
+    label_maps: List[Dict[str, int]] = []
+
+    for example in sampled_examples:
+        query_text = example["query"]
+        try:
+            predictions = predict({"query": query_text}, preprocessed_data)
+        except Exception as exc:  # pragma: no cover - surface errors cleanly
+            LOGGER.exception("Prediction failed for query: %s", query_text)
+            raise exc
+        ranking_ids = [res.get("paragraph_uuid") for res in predictions]
         rankings.append(ranking_ids)
-        label_maps.append(example["label_map"])
+        label_maps.append(example.get("label_map", {}))
 
     metrics = compute_metrics(rankings, label_maps)
     metrics["num_samples"] = len(rankings)
-    metrics["retrieval_top_k"] = args.retrieval_top_k
-    metrics["rerank_top_k"] = min(args.rerank_top_k, args.retrieval_top_k)
+    metrics["use_normalization"] = preprocessed_data.get("use_normalization", False)
+    metrics["use_bm25"] = preprocessed_data.get("use_bm25", False)
+    metrics["bm25_mode"] = "expander" if args.use_bm25 else "none"
 
     LOGGER.info("Evaluation metrics: %s", metrics)
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
@@ -372,6 +252,7 @@ def main() -> None:
         with args.results_path.open("w", encoding="utf-8") as handle:
             json.dump(metrics, handle, ensure_ascii=False, indent=2)
         LOGGER.info("Saved metrics to %s", args.results_path)
+
 
 if __name__ == "__main__":
     main()

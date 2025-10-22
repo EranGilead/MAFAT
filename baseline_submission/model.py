@@ -163,12 +163,16 @@ retriever = None
 reranker = None
 corpus_texts = {}
 
-def preprocess(corpus_dict, use_normalization=True, use_bm25=True, bm25_alpha=0.75):
+def preprocess(
+    corpus_dict,
+    use_normalization=True,
+    use_bm25=True,
+    bm25_alpha=0.75,
+):
     global retriever, reranker, corpus_texts
     print("=" * 60)
     print("PREPROCESSING: Initializing E5 + BM25 + BGE Reranker Pipeline...")
     print("=" * 60)
-
     retriever = E5Retriever()
     reranker = BGEReranker()
 
@@ -176,15 +180,26 @@ def preprocess(corpus_dict, use_normalization=True, use_bm25=True, bm25_alpha=0.
     passages = [doc.get('passage', doc.get('text', '')) for doc in corpus_dict.values()]
     corpus_texts = {doc_id: passages[i] for i, doc_id in enumerate(retriever.corpus_ids)}
 
-    # Embeddings
-    print("Computing E5 embeddings...")
-    retriever.corpus_embeddings = retriever.embed_texts(passages, is_query=False, batch_size=32)
+    normalized_passages = passages
+    normalization_pipeline = None
+    if use_normalization and passages:
+        try:
+            normalization_pipeline = load_hebrew_nlp()
+            print("Applying Hebrew normalization to passages before embedding...")
+            normalized_passages = Parallel(n_jobs=-1, prefer='threads')(
+                delayed(normalize_text)(p, nlp=normalization_pipeline) for p in passages
+            )
+        except ImportError:
+            print("hebspacy not available; using raw passages for embeddings.")
+            normalization_pipeline = None
 
-    # BM25
+    print("Computing E5 embeddings...")
+    retriever.corpus_embeddings = retriever.embed_texts(normalized_passages, is_query=False, batch_size=32)
+
     bm25 = None
     if use_bm25:
-        print("Building BM25 index with normalized tokenization...")
-        tokenized_corpus = [simple_tokenize(p) for p in passages]
+        print("Building BM25 index...")
+        tokenized_corpus = [simple_tokenize(passage) for passage in normalized_passages]
         bm25 = BM25Okapi(tokenized_corpus)
         print("✓ BM25 index built successfully.")
 
@@ -201,12 +216,21 @@ def preprocess(corpus_dict, use_normalization=True, use_bm25=True, bm25_alpha=0.
         'bm25': bm25,
         'bm25_alpha': bm25_alpha,
         'use_bm25': use_bm25,
+        'use_normalization': use_normalization,
+        'normalization_pipeline': normalization_pipeline,
         'num_documents': len(corpus_dict)
     }
 
 
-def predict(query, preprocessed_data):
+def predict(
+    query,
+    preprocessed_data,
+    retrieval_top_k=100,
+    bm25_expansion_k=0,
+    rerank_top_k=20,
+):
     global retriever, reranker, corpus_texts
+
     query_text = query.get('query', '')
     if not query_text:
         return []
@@ -214,44 +238,74 @@ def predict(query, preprocessed_data):
     retriever = retriever or preprocessed_data.get('retriever')
     reranker = reranker or preprocessed_data.get('reranker')
     corpus_texts = corpus_texts or preprocessed_data.get('corpus_texts', {})
-    bm25 = preprocessed_data.get('bm25', None)
+    bm25 = preprocessed_data.get('bm25')
+    bm25_alpha = preprocessed_data.get('bm25_alpha', 0.75)
+    use_bm25 = preprocessed_data.get('use_bm25', bm25 is not None)
+    normalization_pipeline = preprocessed_data.get('normalization_pipeline')
+    use_normalization = preprocessed_data.get('use_normalization', normalization_pipeline is not None)
 
-    if retriever is None or reranker is None or bm25 is None:
-        print("Error: Missing retriever/reranker/bm25 in preprocessed data")
+    if retriever is None or reranker is None:
+        print("Error: Missing retriever or reranker in preprocessed data")
         return []
 
-    print("=" * 80)
-    print(f"🔍 QUERY: {query_text}")
-    print("=" * 80)
+    candidate_indices = []
+    seen = set()
 
-    # Stage 1: E5 retrieval
-    query_embedding = retriever.embed_texts([query_text], is_query=True, batch_size=1)
-    e5_scores = cosine_similarity(query_embedding, retriever.corpus_embeddings)[0]
-    e5_top_indices = np.argsort(e5_scores)[::-1][:50]
-    e5_ids = [retriever.corpus_ids[i] for i in e5_top_indices]
-    
-    print("\n📘 e5 top passages:")
-    for rank, idx in enumerate(e5_top_indices[:20], start=1):
-        pid = retriever.corpus_ids[idx]
-        snippet = corpus_texts[pid][:150].replace("\n", " ")
-        score = e5_scores[idx]
+    normalized_query = query_text
+    if use_normalization and normalization_pipeline is not None:
+        try:
+            normalized_query = normalize_text(query_text, nlp=normalization_pipeline)
+        except Exception as norm_err:
+            print(f"Query normalization failed: {norm_err}")
+            normalized_query = query_text
 
-        print(f"  {rank:2d}. [{pid}]  (score={score:.3f})  →  {snippet}...")
-    # Stage 1.5: BM25 expansion
-    query_tokens = simple_tokenize(query_text)
-    print("BM25 query tokens:", query_tokens)
-    bm25_scores = bm25.get_scores(query_tokens)
-    bm25_top_indices = np.argsort(bm25_scores)[::-1][:40]
-    bm25_ids = [retriever.corpus_ids[i] for i in bm25_top_indices]
+    if retrieval_top_k:
+        query_embedding = retriever.embed_texts([normalized_query], is_query=True, batch_size=1)
+        e5_scores = cosine_similarity(query_embedding, retriever.corpus_embeddings)[0]
+        k_emb = min(retrieval_top_k, len(e5_scores)) if retrieval_top_k > 0 else len(e5_scores)
+        if k_emb >= len(e5_scores):
+            emb_indices = np.argsort(e5_scores)[::-1]
+        else:
+            emb_indices = np.argpartition(e5_scores, -k_emb)[-k_emb:]
+            emb_indices = emb_indices[np.argsort(e5_scores[emb_indices])[::-1]]
+        for idx in emb_indices:
+            if idx not in seen:
+                candidate_indices.append(idx)
+                seen.add(idx)
 
- 
+        if use_bm25 and bm25 is not None:
+            if bm25_expansion_k:
+                k_bm25 = min(bm25_expansion_k, len(retriever.corpus_ids))
+            else:
+                k_bm25 = 0
+                if not candidate_indices:
+                    fallback_k = retrieval_top_k or len(retriever.corpus_ids)
+                    k_bm25 = min(fallback_k, len(retriever.corpus_ids))
+            if k_bm25:
+                tokens = simple_tokenize(normalized_query)
+                bm25_scores = bm25.get_scores(tokens)
+                if k_bm25 >= len(bm25_scores):
+                    bm25_indices = np.argsort(bm25_scores)[::-1]
+                else:
+                    bm25_indices = np.argpartition(bm25_scores, -k_bm25)[-k_bm25:]
+                    bm25_indices = bm25_indices[np.argsort(bm25_scores[bm25_indices])[::-1]]
+                for idx in bm25_indices:
+                    if idx not in seen:
+                        candidate_indices.append(idx)
+                        seen.add(idx)
 
-    # Merge & rerank
-    all_ids = list(dict.fromkeys(e5_ids + bm25_ids))
-    all_passages = [corpus_texts[i] for i in all_ids]
-    print(f"\nStage 2: BGE reranking on {len(all_passages)} candidates...")
-    reranked_results = reranker.rerank(query_text, all_passages, all_ids, top_k=20)
+    if not candidate_indices:
+        print("Warning: no candidates gathered; falling back to embeddings-only retrieval.")
+        query_embedding = retriever.embed_texts([normalized_query], is_query=True, batch_size=1)
+        e5_scores = cosine_similarity(query_embedding, retriever.corpus_embeddings)[0]
+        k_emb = min(retrieval_top_k or len(e5_scores), len(e5_scores))
+        candidate_indices = np.argsort(e5_scores)[::-1][:k_emb].tolist()
 
-    results = [{'paragraph_uuid': pid, 'score': float(score)} for pid, score in reranked_results]
-    print(f"✓ Returned {len(results)} reranked results (BM25 used as expander)\n")
-    return results
+    if rerank_top_k:
+        candidate_indices = candidate_indices[: min(rerank_top_k, len(candidate_indices))]
+
+    candidate_ids = [retriever.corpus_ids[idx] for idx in candidate_indices]
+    candidate_passages = [corpus_texts.get(pid, '') for pid in candidate_ids]
+
+    reranked_results = reranker.rerank(query_text, candidate_passages, candidate_ids, top_k=rerank_top_k or len(candidate_ids))
+    return [{'paragraph_uuid': pid, 'score': float(score)} for pid, score in reranked_results]

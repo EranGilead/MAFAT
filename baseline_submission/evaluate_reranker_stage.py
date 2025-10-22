@@ -4,6 +4,7 @@ import json
 import logging
 import pickle
 import random
+import math
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -146,6 +147,20 @@ def replace_embeddings(preprocessed: dict, saved_embeddings: Dict[str, np.ndarra
     LOGGER.info("Replaced corpus embeddings with saved vectors (shape=%s)", preprocessed["corpus_embeddings"].shape)
 
 
+def compute_ndcg(entries, label_map, k=20):
+    gains = 0.0
+    for rank, entry in enumerate(entries[:k], start=1):
+        rel = label_map.get(entry.get('paragraph_uuid'), 0)
+        if rel > 0:
+            gains += (2 ** rel - 1) / math.log2(rank + 1)
+    ideal_rels = sorted(label_map.values(), reverse=True)
+    ideal = 0.0
+    for rank, rel in enumerate(ideal_rels[:k], start=1):
+        if rel > 0:
+            ideal += (2 ** rel - 1) / math.log2(rank + 1)
+    return gains / ideal if ideal > 0 else 0.0
+
+
 def main() -> None:
     args = parse_args()
 
@@ -182,6 +197,7 @@ def main() -> None:
             LOGGER.warning("Failed to load saved embeddings: %s", exc)
 
     output_rows: List[Dict[str, str]] = []
+    ndcg_values: List[float] = []
     reranker = preprocessed.get("reranker")
     corpus_ids = set(preprocessed.get("corpus_ids", []))
 
@@ -197,6 +213,9 @@ def main() -> None:
             rerank_top_k=args.rerank_top_k,
         )
 
+        ndcg20 = compute_ndcg(top_results, label_map, k=20)
+        ndcg_values.append(ndcg20)
+
         top_ids = set()
         for rank, entry in enumerate(top_results, start=1):
             pid = entry["paragraph_uuid"]
@@ -211,6 +230,7 @@ def main() -> None:
                     "score": entry["score"],
                     "label": label_map.get(pid, 0),
                     "passage": corpus_texts.get(pid, ""),
+                    "ndcg20": ndcg20,
                 }
             )
 
@@ -235,6 +255,7 @@ def main() -> None:
                         "score": score_map.get(pid, float("nan")),
                         "label": label_map.get(pid, 0),
                         "passage": corpus_texts.get(pid, ""),
+                        "ndcg20": "",
                     }
                 )
 
@@ -251,10 +272,17 @@ def main() -> None:
                 "score",
                 "label",
                 "passage",
+                "ndcg20",
             ],
         )
         writer.writeheader()
         writer.writerows(output_rows)
+
+    if ndcg_values:
+        overall_ndcg = sum(ndcg_values) / len(ndcg_values)
+        LOGGER.info("Overall NDCG@20: %.4f", overall_ndcg)
+    else:
+        LOGGER.info("No queries produced NDCG values.")
 
     LOGGER.info("Saved reranker inspection CSV to %s", args.output)
 

@@ -34,20 +34,38 @@ def parse_args() -> argparse.Namespace:
         help="Random seed used to shuffle the dataset before sampling.",
     )
     parser.add_argument(
-        "--use-normalization",
+        "--enable-normalization",
         action="store_true",
-        help="Use Hebrew normalization when building embeddings and embedding queries.",
+        help="Apply Hebrew normalization when building embeddings and embedding queries.",
     )
     parser.add_argument(
-        "--use-bm25",
+        "--disable-bm25",
         action="store_true",
-        help="Use BM25 lexical retrieval and rely solely on E5 embeddings.",
+        help="Skip BM25 lexical retrieval and rely solely on E5 embeddings.",
     )
     parser.add_argument(
         "--bm25-alpha",
         type=float,
-        default=0.8,
+        default=0.75,
         help="Weight for E5 similarity when mixing with BM25 (alpha * E5 + (1-alpha) * BM25).",
+    )
+    parser.add_argument(
+        "--retrieval-top-k",
+        type=int,
+        default=100,
+        help="Number of embedding candidates retrieved before reranking (0 uses all).",
+    )
+    parser.add_argument(
+        "--bm25-top-k",
+        type=int,
+        default=0,
+        help="Number of BM25 candidates to union with embeddings (0 disables BM25 expansion).",
+    )
+    parser.add_argument(
+        "--rerank-top-k",
+        type=int,
+        default=20,
+        help="Number of passages to keep after reranking (0 keeps all candidates).",
     )
     parser.add_argument(
         "--results-path",
@@ -220,8 +238,9 @@ def main() -> None:
     # --- updated preprocess call ---
     preprocessed_data = preprocess(
         corpus_dict,
-        use_normalization=args.use_normalization,
-        use_bm25=args.use_bm25,
+        use_normalization=args.enable_normalization,
+        use_bm25=not args.disable_bm25,
+        bm25_alpha=args.bm25_alpha,
     )
 
     rankings: List[List[str]] = []
@@ -230,7 +249,13 @@ def main() -> None:
     for example in sampled_examples:
         query_text = example["query"]
         try:
-            predictions = predict({"query": query_text}, preprocessed_data)
+            predictions = predict(
+                {"query": query_text},
+                preprocessed_data,
+                retrieval_top_k=args.retrieval_top_k,
+                bm25_expansion_k=args.bm25_top_k,
+                rerank_top_k=args.rerank_top_k,
+            )
         except Exception as exc:  # pragma: no cover - surface errors cleanly
             LOGGER.exception("Prediction failed for query: %s", query_text)
             raise exc
@@ -242,7 +267,10 @@ def main() -> None:
     metrics["num_samples"] = len(rankings)
     metrics["use_normalization"] = preprocessed_data.get("use_normalization", False)
     metrics["use_bm25"] = preprocessed_data.get("use_bm25", False)
-    metrics["bm25_mode"] = "expander" if args.use_bm25 else "none"
+    metrics["bm25_alpha"] = preprocessed_data.get("bm25_alpha", args.bm25_alpha)
+    metrics["retrieval_top_k"] = args.retrieval_top_k
+    metrics["bm25_top_k"] = args.bm25_top_k
+    metrics["rerank_top_k"] = args.rerank_top_k
 
     LOGGER.info("Evaluation metrics: %s", metrics)
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
